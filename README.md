@@ -12,6 +12,22 @@ caller workflow and nothing else.
 | `opencode/commands/agent-task.md` | the flow as an opencode command |
 | `prompts/01-plan.md` … `05-pr.md` | one prompt per phase |
 | `prompts/ci-fix.md` | the deliberately narrow CI-fix prompt |
+| `agent-onboard.sh` | run from a target repo clone to wire that repo up to this harness |
+
+## Onboarding a target repo
+
+The onboarding script ships here, so this repo is all you need to enable a new
+target:
+
+    gh repo clone <you>/agent-harness    # or curl the raw script at tag v1
+    cd /path/to/target-repo
+    /path/to/agent-harness/agent-onboard.sh --harness <you>/agent-harness --owner <you> \
+      --app-id <app-id> --app-key-file ~/keys/agent.pem --ci-workflow "CI" --dry-run
+
+Inspect the dry run, then re-run without `--dry-run`. It creates the `agent`
+label, three secrets, two variables, the gated `agent` environment, and commits
+the two caller workflows on a branch with a PR. The script operates on whatever
+repo you run it from — nothing of it stays behind beyond the two callers.
 
 ## Phases and models
 
