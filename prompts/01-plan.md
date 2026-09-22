@@ -1,16 +1,23 @@
-Task: Linear issue __LINEAR_ID__.
+Task: the spec in .agent/task.md — a frozen snapshot of GitHub issue
+#__ISSUE_NUMBER__ taken when this run was triggered. Do NOT re-fetch the issue
+via gh or any API: later edits by the issue author are deliberately excluded;
+the snapshot is the approved spec.
 
-Read it before anything else:
-  everything-cli linear issue get __LINEAR_ID__ --format toon
-  everything-cli linear issue comments __LINEAR_ID__ --format toon
+If the snapshot references a Linear identifier (e.g. ENG-123), read that card
+as supplementary context:
+  everything-cli linear issue get <ID> --format toon
+  everything-cli linear issue comments <ID> --format toon
+The frozen snapshot remains the spec of record.
 
 This is a non-interactive session. Nobody will answer questions, and you will
 be handed off to a different model for implementation — so the plan has to
 stand on its own.
 
-If the issue is too underspecified for sound assumptions, do NOT plan. Post
-your open questions instead:
-  everything-cli linear issue comment create __LINEAR_ID__ --body "..."
+If the spec is too underspecified for sound assumptions, do NOT plan. Post
+your open questions — on the Linear card if one is linked, otherwise on the
+GitHub issue:
+  everything-cli linear issue comment create <ID> --body "..."
+  gh issue comment __ISSUE_NUMBER__ --body "..."
 then write the single line NEEDS-CLARIFICATION to .agent/plan.md and stop.
 
 Otherwise use the gbuild-plan skill and write .agent/plan.md containing:

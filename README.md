@@ -1,7 +1,7 @@
 # agent-harness
 
-Central definition of the Linear -> opencode -> PR agent. Target repos hold a
-caller workflow and nothing else.
+Central definition of the issue -> opencode -> PR agent (Linear optional).
+Target repos hold a caller workflow and nothing else.
 
 | Path | What it is |
 |---|---|
@@ -28,6 +28,30 @@ Inspect the dry run, then re-run without `--dry-run`. It creates the `agent`
 label, three secrets, two variables, the gated `agent` environment, and commits
 the two caller workflows on a branch with a PR. The script operates on whatever
 repo you run it from — nothing of it stays behind beyond the two callers.
+
+## Triggering a run
+
+Two ways, both wired in the target repo's caller workflow:
+
+- **Apply the `agent` label** to an issue. Only logins in the repo's
+  `AGENT_ALLOWED_ACTORS` variable (JSON array, set by `agent-onboard.sh` from
+  `--owner` + `--actors`) may trigger this way.
+- **Comment `@bot …` on an issue.** The commenter's `author_association` must
+  be MEMBER, OWNER or COLLABORATOR — expression-checked, no API call needed.
+  PR comments never trigger (`issue.pull_request` is set on those events).
+
+The spec is the issue itself, **frozen at trigger time**: the workflow writes
+`github.event.issue.title`/`body` from the event payload to `.agent/task.md`
+and the phase prompts read only that file — an author editing the issue after
+the trigger cannot change what the agent works on. The run also quotes the
+frozen spec back in its acknowledgement comment, so the executed text is
+visible in the issue timeline. If the issue names a Linear card (`ENG-123`),
+the card is read as supplementary context and gets status comments; without
+one the run is GitHub-only and the PR body uses `Closes #N` instead of
+`Fixes ENG-123`.
+
+The `agent` environment's required reviewer (set by `agent-onboard.sh` from
+`--owner`) is the human-approval layer on top of both triggers.
 
 ## Phases and models
 

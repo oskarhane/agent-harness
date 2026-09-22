@@ -12,6 +12,7 @@ set -euo pipefail
 HARNESS=""                     # owner/repo of the harness
 HARNESS_REF="v1"
 OWNER=""
+ACTORS=""                      # comma-separated extra logins allowed to trigger via the label
 APP_ID=""
 APP_KEY_FILE=""
 CI_WORKFLOW="CI"               # literal `name:` of the workflow whose failures trigger the fix loop
@@ -29,6 +30,9 @@ agent-onboard.sh [options]
   --harness OWNER/REPO    harness repo (required)
   --harness-ref REF       tag/branch callers pin to      (default: v1)
   --owner LOGIN           login permitted to trigger     (required)
+  --actors "A,B"          extra logins allowed to trigger via the label
+                          (default: just --owner; a MEMBER/OWNER/COLLABORATOR
+                          "@bot" comment always triggers regardless)
   --app-id ID             GitHub App id                  (required)
   --app-key-file PATH     App private key .pem           (required first time)
   --ci-workflow NAME      exact `name:` of your CI workflow (default: CI)
@@ -49,6 +53,7 @@ while [ $# -gt 0 ]; do
     --harness) HARNESS="$2"; shift 2 ;;
     --harness-ref) HARNESS_REF="$2"; shift 2 ;;
     --owner) OWNER="$2"; shift 2 ;;
+    --actors) ACTORS="$2"; shift 2 ;;
     --app-id) APP_ID="$2"; shift 2 ;;
     --app-key-file) APP_KEY_FILE="$2"; shift 2 ;;
     --ci-workflow) CI_WORKFLOW="$2"; shift 2 ;;
@@ -74,6 +79,10 @@ cd "$(git rev-parse --show-toplevel)"
 
 [ -n "$HARNESS" ] || die "--harness is required"
 [ -n "$OWNER" ] || die "--owner is required"
+
+# Trigger allowlist for the label path: the owner plus any --actors, as JSON.
+ALLOWED_ACTORS=$(jq -nc --arg o "$OWNER" --arg a "$ACTORS" \
+  '[$o] + ($a | split(",") | map(gsub("^\\s+|\\s+$";"")) | map(select(length > 0))) | unique')
 [ -n "$APP_ID" ] || die "--app-id is required"
 case "$HARNESS" in */*) ;; *) die "--harness must be owner/repo";; esac
 
@@ -84,7 +93,7 @@ cat <<SUMMARY
 
 repo        $NWO (default: $DEFAULT_BRANCH)
 harness     $HARNESS@$HARNESS_REF
-trigger     label "$LABEL" applied by $OWNER
+trigger     label "$LABEL" applied by $ALLOWED_ACTORS, or an "@bot" comment by a MEMBER/OWNER/COLLABORATOR
 PR author   GitHub App $APP_ID
 ci-fix      $([ "$WITH_CI_FIX" = 1 ] && echo "on failures of \"$CI_WORKFLOW\"" || echo "skipped")
 SUMMARY
@@ -129,6 +138,7 @@ fi
 step "variables"
 run gh variable set AGENT_OWNER --body "$OWNER"
 run gh variable set AGENT_APP_ID --body "$APP_ID"
+run gh variable set AGENT_ALLOWED_ACTORS --body "$ALLOWED_ACTORS"
 
 # -------------------------------------------------------------------- label ---
 step "label"
@@ -168,6 +178,8 @@ name: agent
 on:
   issues:
     types: [labeled]
+  issue_comment:
+    types: [created]
 
 concurrency:
   group: agent-issue-\${{ github.event.issue.number }}
@@ -177,10 +189,18 @@ permissions: {}
 
 jobs:
   agent:
-    if: github.event.label.name == '$LABEL' && github.actor == vars.AGENT_OWNER
+    if: >-
+      (github.event_name == 'issues' &&
+       github.event.label.name == '$LABEL' &&
+       contains(fromJSON(vars.AGENT_ALLOWED_ACTORS), github.actor)) ||
+      (github.event_name == 'issue_comment' &&
+       github.event.issue.pull_request == null &&
+       contains(github.event.comment.body, '@bot') &&
+       contains(fromJSON('["MEMBER","OWNER","COLLABORATOR"]'), github.event.comment.author_association))
     uses: $HARNESS/.github/workflows/agent.yml@$HARNESS_REF
     with:
       owner: \${{ vars.AGENT_OWNER }}
+      allowed-actors: \${{ vars.AGENT_ALLOWED_ACTORS }}
       app-id: \${{ vars.AGENT_APP_ID }}
     secrets: inherit
 YAML
@@ -245,8 +265,9 @@ cat <<NEXT
 2. Branch protection on $DEFAULT_BRANCH: the agent opens PRs but must not merge.
 3. --ci-workflow "$CI_WORKFLOW" matches your CI workflow's \`name:\` exactly,
    or the fix loop never fires.
-4. Smoke test: Linear card -> GitHub issue titled with just its identifier ->
-   apply "$LABEL". Then confirm in the run log:
+4. Smoke test: open a throwaway issue (optionally titled with a Linear id,
+   e.g. ENG-123) and apply "$LABEL" — or comment "@bot pick this up".
+   Then confirm in the run log:
      - opencode is 2.x
      - .agent/plan.md AND .agent/review-1.json both exist
        (missing review = subagent blocked, review silently no-opped)
