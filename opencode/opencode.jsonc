@@ -1,0 +1,51 @@
+{
+  "$schema": "https://opencode.ai/config.json",
+
+  // V2 keys: plugins (plural — v1 used singular "plugin"), and
+  // shell/edit/subagent (v1: bash/write+patch/task).
+  // npm coordinate, not github:...::path: — bun/npm cannot resolve that
+  // selector, so the subdirectory install form fails to load.
+  "plugins": ["opencode-gbuild@0.4.0"],
+
+  "permission": {
+    "edit": "allow",
+    "shell": "allow",
+    // MUST be allowed: the gbuild review skills dispatch a subagent. Without
+    // it, review silently no-ops while the implementer proceeds unreviewed.
+    "subagent": "allow"
+  },
+
+  // Default is 1: a primary agent may spawn a subagent, but a subagent may
+  // not. If a gbuild skill is itself running as a subagent, the reviewer
+  // spawn is blocked at depth 1 — the silent-no-op failure mode.
+  "subagent_depth": 2,
+
+  "autoupdate": false,        // a self-update mid-run would void the 2.x pin
+  "share": "disabled",        // never expose a CI session publicly
+  "snapshot": false,          // skip internal-git indexing of the whole tree
+  "compaction": { "prune": true },      // long runs: drop stale tool output
+
+  // Fireworks is native (models.dev id "fireworks-ai", env FIREWORKS_API_KEY),
+  // but the documented setup is the interactive /connect flow, so declare it
+  // here instead. {env:} keeps the key out of the config file.
+  "provider": {
+    "fireworks-ai": {
+      "options": {
+        "baseURL": "https://api.fireworks.ai/inference/v1",
+        "apiKey": "{env:FIREWORKS_API_KEY}"
+      }
+    }
+  },
+  // Only Fireworks: a stray key in the runner env can't reroute spend.
+  "enabled_providers": ["fireworks-ai"],
+  "small_model": "fireworks-ai/deepseek-flash-latest",  // titles etc. do not need the coding model
+
+  // Config CAN define agents even though plugins cannot, which closes
+  // gbuild's reviewer gap. Structurally unable to edit what it reviews.
+  "agent": {
+    "gbuild-reviewer": {
+      "description": "Reviews the implementer's work. Read-only.",
+      "tools": { "write": false, "edit": false }
+    }
+  }
+}

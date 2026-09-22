@@ -1,0 +1,110 @@
+# Reusable. Callers trigger on `workflow_run` for their own CI workflow name.
+name: agent-ci-fix (reusable)
+
+on:
+  workflow_call:
+    inputs:
+      app-id:
+        required: true
+        type: string
+      model:
+        required: false
+        type: string
+        default: "fireworks-ai/kimi-latest"
+      opencode-version:
+        required: false
+        type: string
+        default: "2.0.1"
+      gbuild-version:
+        required: false
+        type: string
+        default: "0.4.0"
+      max-attempts:
+        required: false
+        type: number
+        default: 3
+    secrets:
+      AGENT_APP_PRIVATE_KEY:
+        required: true
+      FIREWORKS_API_KEY:
+        required: true
+
+jobs:
+  fix:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      BRANCH: ${{ github.event.workflow_run.head_branch }}
+      HARNESS_DIR: ${{ runner.temp }}/harness
+    steps:
+      - name: Mint App token
+        id: app
+        uses: actions/create-github-app-token@v2
+        with:
+          app-id: ${{ inputs.app-id }}
+          private-key: ${{ secrets.AGENT_APP_PRIVATE_KEY }}
+
+      - uses: actions/checkout@v5
+        with:
+          token: ${{ steps.app.outputs.token }}
+          ref: ${{ github.event.workflow_run.head_branch }}
+          fetch-depth: 0
+
+      - name: Check out harness
+        run: |
+          set -euo pipefail
+          ref_full="${{ github.job_workflow_ref }}"
+          repo=$(printf '%s' "$ref_full" | cut -d/ -f1,2)
+          ref=${ref_full#*@}
+          git clone --depth 1 --branch "${ref##*/}" \
+            "${{ github.server_url }}/$repo" "$HARNESS_DIR"
+
+      - name: Cap the retry loop
+        run: |
+          set -euo pipefail
+          base="${{ github.event.repository.default_branch }}"
+          n=$(git log --oneline "origin/$base..HEAD" --grep='\[agent-ci-fix\]' | wc -l | tr -d ' ')
+          echo "prior fix attempts: $n"
+          if [ "$n" -ge "${{ inputs.max-attempts }}" ]; then
+            echo "::error::$n fix attempts already — stopping, this needs a human"
+            exit 1
+          fi
+
+      - name: Capture failing logs
+        env:
+          GH_TOKEN: ${{ steps.app.outputs.token }}
+        run: |
+          set -euo pipefail
+          mkdir -p .agent
+          # Needs the App to have Actions: read.
+          gh run view "${{ github.event.workflow_run.id }}" --log-failed \
+            | tail -c 200000 >.agent/ci-failure.log
+          wc -l .agent/ci-failure.log
+
+      - name: Install opencode
+        env:
+          VERSION: ${{ inputs.opencode-version }}
+        run: |
+          set -euo pipefail
+          curl -fsSL https://opencode.ai/install | bash
+          echo "$HOME/.opencode/bin" >>"$GITHUB_PATH"
+
+      - name: Restore plugin cache
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/opencode/npm
+          key: opencode-plugins-${{ inputs.gbuild-version }}
+
+      - name: Fix and push
+        env:
+          FIREWORKS_API_KEY: ${{ secrets.FIREWORKS_API_KEY }}
+          GH_TOKEN: ${{ steps.app.outputs.token }}
+          OPENCODE_CONFIG_DIR: ${{ runner.temp }}/harness/opencode
+          OPENCODE_DISABLE_PROJECT_CONFIG: "1"
+          OPENCODE_CONFIG_CONTENT: '{"model":"${{ inputs.model }}","plugins":["opencode-gbuild@${{ inputs.gbuild-version }}"]}'
+        run: |
+          set -euo pipefail
+          git config user.email "agent@users.noreply.github.com"
+          git config user.name "agent"
+          opencode run "$(cat "$HARNESS_DIR/prompts/ci-fix.md")"
+          git push origin "HEAD:$BRANCH"

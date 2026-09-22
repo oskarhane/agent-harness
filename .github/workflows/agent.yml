@@ -1,0 +1,411 @@
+# Reusable. Callers trigger on `issues: labeled` and pass owner + app-id.
+name: agent (reusable)
+
+on:
+  workflow_call:
+    inputs:
+      owner:
+        description: GitHub login permitted to trigger runs
+        required: true
+        type: string
+      app-id:
+        description: GitHub App id used to author the PR
+        required: true
+        type: string
+      model:
+        description: fallback model for any phase left unset
+        required: false
+        type: string
+        default: "fireworks-ai/kimi-latest"
+      plan-model:
+        required: false
+        type: string
+        default: ""
+      implement-model:
+        required: false
+        type: string
+        default: "fireworks-ai/deepseek-flash-latest"
+      review-model:
+        required: false
+        type: string
+        default: ""
+      pr-model:
+        required: false
+        type: string
+        default: ""
+      max-cycles:
+        description: review/fix cycles before the run gives up
+        required: false
+        type: number
+        default: 2
+      opencode-version:
+        required: false
+        type: string
+        default: "2.0.1"
+      gbuild-version:
+        required: false
+        type: string
+        default: "0.4.0"
+      ecli-ref:
+        required: false
+        type: string
+        default: "main"
+    secrets:
+      AGENT_APP_PRIVATE_KEY:
+        required: true
+      FIREWORKS_API_KEY:
+        required: true
+      LINEAR_API_KEY:
+        required: true
+
+jobs:
+  agent:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    environment: agent          # resolves in the CALLER repo
+    env:
+      EVERYTHING_CLI_CONFIG_DIR: ${{ runner.temp }}/ecli-config
+      HARNESS_DIR: ${{ runner.temp }}/harness
+      RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+    steps:
+      # Fail closed even if a caller forgets its own `if:` gate.
+      - name: Gate on actor
+        run: |
+          if [ "${{ github.actor }}" != "${{ inputs.owner }}" ]; then
+            echo "::error::${{ github.actor }} is not permitted to trigger the agent"
+            exit 1
+          fi
+
+      # App installation token: makes the App the PR author AND lets the
+      # resulting PR trigger pull_request workflows, which GITHUB_TOKEN-
+      # authored PRs do not.
+      - name: Mint App token
+        id: app
+        uses: actions/create-github-app-token@v2
+        with:
+          app-id: ${{ inputs.app-id }}
+          private-key: ${{ secrets.AGENT_APP_PRIVATE_KEY }}
+
+      - uses: actions/checkout@v5
+        with:
+          token: ${{ steps.app.outputs.token }}
+          fetch-depth: 0
+
+      # Check the harness out at the exact ref this workflow was called at, so
+      # config and prompt always match the workflow running them.
+      - name: Check out harness
+        run: |
+          set -euo pipefail
+          ref_full="${{ github.job_workflow_ref }}"   # owner/repo/.github/...@ref
+          repo=$(printf '%s' "$ref_full" | cut -d/ -f1,2)
+          ref=${ref_full#*@}
+          echo "harness $repo @ $ref"
+          git clone --depth 1 --branch "${ref##*/}" \
+            "${{ github.server_url }}/$repo" "$HARNESS_DIR"
+
+      - name: Resolve Linear id
+        id: linear
+        env:
+          GH_TOKEN: ${{ steps.app.outputs.token }}
+          ISSUE: ${{ github.event.issue.number }}
+          TITLE: ${{ github.event.issue.title }}
+          BODY: ${{ github.event.issue.body }}
+        run: |
+          set -euo pipefail
+          id=$(printf '%s\n%s\n' "$TITLE" "$BODY" \
+               | grep -oE '\b[A-Z][A-Z0-9]{1,9}-[0-9]+\b' | head -n1 || true)
+          if [ -z "$id" ]; then
+            gh issue comment "$ISSUE" --body \
+              "No Linear identifier (e.g. ENG-123) in the title or body — nothing to work on."
+            exit 1
+          fi
+          echo "id=$id" >>"$GITHUB_OUTPUT"
+          echo "branch=agent/$(printf '%s' "$id" | tr '[:upper:]' '[:lower:]')" >>"$GITHUB_OUTPUT"
+
+      - uses: actions/setup-go@v6
+        with:
+          go-version: stable
+
+      - name: Restore everything-cli
+        id: ecli-cache
+        uses: actions/cache@v4
+        with:
+          path: ~/.local/bin/everything-cli
+          key: ecli-${{ runner.os }}-${{ inputs.ecli-ref }}
+
+      - name: Build everything-cli
+        if: steps.ecli-cache.outputs.cache-hit != 'true'
+        run: |
+          set -euo pipefail
+          # The published installer still ships the old google-cli-named
+          # release, so build from source and cache the binary.
+          git clone --depth 1 --branch "${{ inputs.ecli-ref }}" \
+            https://github.com/oskarhane/everything-cli "$RUNNER_TEMP/ecli-src"
+          make -C "$RUNNER_TEMP/ecli-src" build
+          mkdir -p "$HOME/.local/bin"
+          cp "$RUNNER_TEMP/ecli-src/bin/everything-cli" "$HOME/.local/bin/"
+
+      - name: Configure Linear account
+        env:
+          LINEAR_API_KEY: ${{ secrets.LINEAR_API_KEY }}
+        run: |
+          set -euo pipefail
+          echo "$HOME/.local/bin" >>"$GITHUB_PATH"
+          export PATH="$HOME/.local/bin:$PATH"
+          mkdir -p "$EVERYTHING_CLI_CONFIG_DIR"
+          # Own step so the key lands in the 0600 account file rather than the
+          # agent step's env. Pipe is the fallback if the env var is not read
+          # non-interactively.
+          everything-cli linear account add ci \
+            || printf '%s\n' "$LINEAR_API_KEY" | everything-cli linear account add ci
+          everything-cli linear account whoami
+
+      - name: Install opencode
+        env:
+          VERSION: ${{ inputs.opencode-version }}
+        run: |
+          set -euo pipefail
+          curl -fsSL https://opencode.ai/install | bash
+          echo "$HOME/.opencode/bin" >>"$GITHUB_PATH"
+          export PATH="$HOME/.opencode/bin:$PATH"
+          v=$(opencode --version)
+          echo "opencode $v"
+          case "$v" in
+            2.*) ;;
+            *) echo "::error::opencode $v is not 2.x — the gbuild V2 plugin will not load"; exit 1 ;;
+          esac
+
+      - name: Restore plugin cache
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/opencode/npm
+          key: opencode-plugins-${{ inputs.gbuild-version }}
+
+      - name: Install everything-cli skill for opencode
+        run: |
+          set -euo pipefail
+          # Skill install detects agents by their config dir existing, which a
+          # fresh runner does not have — create it first or this no-ops.
+          mkdir -p "$HOME/.config/opencode"
+          everything-cli skill install --agent opencode
+
+      - name: Render phase prompts
+        run: |
+          set -euo pipefail
+          mkdir -p .agent "$RUNNER_TEMP/prompts"
+          for f in "$HARNESS_DIR"/prompts/0*.md; do
+            sed -e "s|__LINEAR_ID__|${{ steps.linear.outputs.id }}|g" \
+                -e "s|__BRANCH__|${{ steps.linear.outputs.branch }}|g" \
+                "$f" >"$RUNNER_TEMP/prompts/$(basename "$f")"
+          done
+          ls -1 "$RUNNER_TEMP/prompts"
+
+      - name: Start opencode server
+        env:
+          FIREWORKS_API_KEY: ${{ secrets.FIREWORKS_API_KEY }}
+          OPENCODE_CONFIG_DIR: ${{ runner.temp }}/harness/opencode
+          OPENCODE_DISABLE_PROJECT_CONFIG: "1"
+          OPENCODE_CONFIG_CONTENT: '{"model":"${{ inputs.model }}","plugins":["opencode-gbuild@${{ inputs.gbuild-version }}"]}'
+        run: |
+          set -uo pipefail
+          # One server for all phases: otherwise plugin + MCP cold boot is paid
+          # once per phase, and there are up to seven of them.
+          nohup opencode serve --port 4096 >"$RUNNER_TEMP/serve.log" 2>&1 &
+          echo $! >"$RUNNER_TEMP/serve.pid"
+          for _ in $(seq 1 60); do
+            code=$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:4096/api/session || echo 000)
+            [ "$code" != "000" ] && { echo "ATTACH=http://127.0.0.1:4096" >>"$GITHUB_ENV"; exit 0; }
+            sleep 1
+          done
+          echo "::warning::opencode serve did not come up — phases will each cold boot"
+          sed -n '1,40p' "$RUNNER_TEMP/serve.log" || true
+          echo "ATTACH=" >>"$GITHUB_ENV"
+
+      - name: Phase 1 — plan
+        env:
+          FIREWORKS_API_KEY: ${{ secrets.FIREWORKS_API_KEY }}
+          GH_TOKEN: ${{ steps.app.outputs.token }}
+          OPENCODE_CONFIG_DIR: ${{ runner.temp }}/harness/opencode
+          OPENCODE_DISABLE_PROJECT_CONFIG: "1"
+          OPENCODE_CONFIG_CONTENT: '{"model":"${{ inputs.model }}","plugins":["opencode-gbuild@${{ inputs.gbuild-version }}"]}'
+        run: |
+          set -euo pipefail
+          git config user.email "agent@users.noreply.github.com"
+          git config user.name "agent"
+
+          M_PLAN="${{ inputs.plan-model }}"; [ -n "$M_PLAN" ] || M_PLAN="${{ inputs.model }}"
+          echo "M_PLAN=$M_PLAN" >>"$GITHUB_ENV"
+
+          # Create the session up front so every later phase threads --session
+          # explicitly. --continue means "the last session", which is ambiguous
+          # the moment anything else runs in this workspace.
+          sid=$(opencode api v2.session.create \
+                  --data "{\"title\":\"agent ${{ steps.linear.outputs.id }}\"}" 2>/dev/null \
+                | jq -r '.id // .sessionID // empty' || true)
+          if [ -n "$sid" ]; then
+            echo "SID=$sid" >>"$GITHUB_ENV"
+            echo "session $sid"
+          else
+            echo "::warning::could not pre-create a session — falling back to --continue"
+            echo "SID=" >>"$GITHUB_ENV"
+          fi
+
+          opencode run ${ATTACH:+--attach "$ATTACH"} ${sid:+--session "$sid"} \
+            -m "$M_PLAN" "$(cat "$RUNNER_TEMP/prompts/01-plan.md")"
+
+      - name: Gate — plan exists and is actionable
+        run: |
+          set -euo pipefail
+          test -f .agent/plan.md || { echo "::error::no .agent/plan.md — the plan phase produced nothing"; exit 1; }
+          if grep -q '^NEEDS-CLARIFICATION' .agent/plan.md; then
+            echo "::notice::issue was underspecified; questions posted to Linear, stopping before implementation"
+            echo "STOP=1" >>"$GITHUB_ENV"
+          fi
+          wc -l .agent/plan.md
+
+      - name: Phase 2 — implement
+        if: env.STOP != '1'
+        env:
+          FIREWORKS_API_KEY: ${{ secrets.FIREWORKS_API_KEY }}
+          GH_TOKEN: ${{ steps.app.outputs.token }}
+          OPENCODE_CONFIG_DIR: ${{ runner.temp }}/harness/opencode
+          OPENCODE_DISABLE_PROJECT_CONFIG: "1"
+          OPENCODE_CONFIG_CONTENT: '{"model":"${{ inputs.model }}","plugins":["opencode-gbuild@${{ inputs.gbuild-version }}"]}'
+        run: |
+          set -euo pipefail
+          M="${{ inputs.implement-model }}"; [ -n "$M" ] || M="${{ inputs.model }}"
+          echo "implementing with $M"
+          resume() { if [ -n "${SID:-}" ]; then printf '%s %s' --session "$SID"; else printf '%s' --continue; fi; }
+          opencode run ${ATTACH:+--attach "$ATTACH"} $(resume) \
+            -m "$M" "$(cat "$RUNNER_TEMP/prompts/02-implement.md")"
+
+      - name: Gate — something was actually implemented
+        if: env.STOP != '1'
+        run: |
+          set -euo pipefail
+          base="${{ github.event.repository.default_branch }}"
+          if [ -z "$(git log --oneline "origin/$base..HEAD" 2>/dev/null)" ] && [ -z "$(git status --porcelain)" ]; then
+            echo "::error::implement phase produced no commits and no working-tree changes"
+            exit 1
+          fi
+          git --no-pager log --oneline "origin/$base..HEAD" 2>/dev/null | head -20 || true
+
+      - name: Phases 3-6 — review / fix cycles
+        if: env.STOP != '1'
+        env:
+          FIREWORKS_API_KEY: ${{ secrets.FIREWORKS_API_KEY }}
+          GH_TOKEN: ${{ steps.app.outputs.token }}
+          OPENCODE_CONFIG_DIR: ${{ runner.temp }}/harness/opencode
+          OPENCODE_DISABLE_PROJECT_CONFIG: "1"
+          OPENCODE_CONFIG_CONTENT: '{"model":"${{ inputs.model }}","plugins":["opencode-gbuild@${{ inputs.gbuild-version }}"]}'
+        run: |
+          set -euo pipefail
+          M_REVIEW="${{ inputs.review-model }}"; [ -n "$M_REVIEW" ] || M_REVIEW="${{ inputs.model }}"
+          M_FIX="${{ inputs.implement-model }}"; [ -n "$M_FIX" ] || M_FIX="${{ inputs.model }}"
+          resume() { if [ -n "${SID:-}" ]; then printf '%s %s' --session "$SID"; else printf '%s' --continue; fi; }
+
+          for cycle in $(seq 1 ${{ inputs.max-cycles }}); do
+            rf=".agent/review-$cycle.json"
+            echo "::group::review cycle $cycle ($M_REVIEW)"
+            sed "s|__REVIEW_FILE__|$rf|g" "$RUNNER_TEMP/prompts/03-review.md" >"$RUNNER_TEMP/prompts/r.md"
+            opencode run ${ATTACH:+--attach "$ATTACH"} $(resume) -m "$M_REVIEW" \
+              "$(cat "$RUNNER_TEMP/prompts/r.md")"
+            echo "::endgroup::"
+
+            # The single most important gate: no file here means the reviewer
+            # subagent never ran, and an unreviewed PR looks identical to a
+            # reviewed one.
+            if [ ! -f "$rf" ]; then
+              echo "::error::$rf missing — the review subagent did not run. Check that 'subagent' is permitted and subagent_depth >= 2."
+              exit 1
+            fi
+            jq -e 'type == "array"' "$rf" >/dev/null || { echo "::error::$rf is not a JSON array"; exit 1; }
+
+            open=$(jq '[.[] | select((.severity=="blocking" or .severity=="medium") and (.resolved != true))] | length' "$rf")
+            blocking=$(jq '[.[] | select(.severity=="blocking" and (.resolved != true))] | length' "$rf")
+            echo "cycle $cycle: $open open blocking/medium findings ($blocking blocking)"
+            [ "$open" -eq 0 ] && { echo "clean — leaving the loop"; break; }
+
+            echo "::group::fix cycle $cycle ($M_FIX)"
+            sed "s|__REVIEW_FILE__|$rf|g" "$RUNNER_TEMP/prompts/04-fix.md" >"$RUNNER_TEMP/prompts/f.md"
+            opencode run ${ATTACH:+--attach "$ATTACH"} $(resume) -m "$M_FIX" \
+              "$(cat "$RUNNER_TEMP/prompts/f.md")"
+            echo "::endgroup::"
+          done
+
+          last=$(ls -1 .agent/review-*.json | sort -V | tail -n1)
+          if [ "$(jq '[.[] | select(.severity=="blocking" and (.resolved != true))] | length' "$last")" -gt 0 ]; then
+            echo "::warning::blocking findings remain after ${{ inputs.max-cycles }} cycles — the PR will be a draft"
+            echo "DRAFT=1" >>"$GITHUB_ENV"
+          fi
+
+      - name: Phase 7 — open the PR
+        if: env.STOP != '1'
+        env:
+          FIREWORKS_API_KEY: ${{ secrets.FIREWORKS_API_KEY }}
+          GH_TOKEN: ${{ steps.app.outputs.token }}
+          OPENCODE_CONFIG_DIR: ${{ runner.temp }}/harness/opencode
+          OPENCODE_DISABLE_PROJECT_CONFIG: "1"
+          OPENCODE_CONFIG_CONTENT: '{"model":"${{ inputs.model }}","plugins":["opencode-gbuild@${{ inputs.gbuild-version }}"]}'
+        run: |
+          set -euo pipefail
+          M="${{ inputs.pr-model }}"; [ -n "$M" ] || M="${{ inputs.model }}"
+          resume() { if [ -n "${SID:-}" ]; then printf '%s %s' --session "$SID"; else printf '%s' --continue; fi; }
+          opencode run ${ATTACH:+--attach "$ATTACH"} $(resume) -m "$M" \
+            "$(cat "$RUNNER_TEMP/prompts/05-pr.md")"
+
+      - name: Gate — the PR exists
+        if: env.STOP != '1'
+        env:
+          GH_TOKEN: ${{ steps.app.outputs.token }}
+        run: |
+          set -euo pipefail
+          url=$(gh pr list --head "${{ steps.linear.outputs.branch }}" --json url -q '.[0].url')
+          [ -n "$url" ] || { echo "::error::no PR on ${{ steps.linear.outputs.branch }}"; exit 1; }
+          echo "$url"
+
+      - name: Which models actually answered
+        if: always()
+        run: |
+          # Worth checking rather than trusting: a non-default model can revert
+          # to the agent default mid-session, with the transcript still naming
+          # the model you asked for, and both get billed.
+          opencode stats --days 1 --models || echo "(stats unavailable)"
+
+      - name: Stop opencode server
+        if: always()
+        run: |
+          [ -f "$RUNNER_TEMP/serve.pid" ] && kill "$(cat "$RUNNER_TEMP/serve.pid")" 2>/dev/null || true
+          exit 0
+
+      - name: Upload artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: agent-run-${{ github.run_id }}
+          path: .agent/
+          if-no-files-found: warn
+
+      - name: Report back to Linear
+        if: always()
+        env:
+          GH_TOKEN: ${{ steps.app.outputs.token }}
+          ID: ${{ steps.linear.outputs.id }}
+        run: |
+          set -uo pipefail
+          [ -n "${ID:-}" ] || exit 0
+          pr=$(gh pr list --head "${{ steps.linear.outputs.branch }}" --json url -q '.[0].url' 2>/dev/null || true)
+          body="Agent run **${{ job.status }}** — $RUN_URL"
+          if [ -n "$pr" ]; then
+            body="$body"$'\n'"PR: $pr"
+            everything-cli linear issue attachment create "$ID" --url "$pr" --title "PR" || true
+          fi
+          everything-cli linear issue comment create "$ID" --body "$body" || true
+
+      - name: Release the label
+        if: always()
+        env:
+          GH_TOKEN: ${{ steps.app.outputs.token }}
+        run: |
+          # Removing it makes re-applying the label a re-run button.
+          gh issue edit "${{ github.event.issue.number }}" --remove-label agent || true
